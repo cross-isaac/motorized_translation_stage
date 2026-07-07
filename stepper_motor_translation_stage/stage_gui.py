@@ -18,10 +18,12 @@ Requires:  py -m pip install pyserial   (tkinter ships with CPython).
 Run:       py stage_gui.py
 """
 
+import csv
 import json
 import queue
 import threading
 import time
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -58,6 +60,13 @@ class StageGUI:
         self.prog_loop = False
         self.prog_repeat = 1
         self.loops_done = 0
+
+        # --- CSV logging state ---
+        self.last_pos_in = None    # most recent position parsed from a POS line
+        self.csv_file = None
+        self.csv_writer = None
+        self.run_start = 0.0       # time.monotonic() at program start
+        self.last_sample = 0.0     # last CSV sample time (for 1 Hz dwell sampling)
 
         root.title("Translation Stage Control")
         root.geometry("560x860")
@@ -103,6 +112,20 @@ class StageGUI:
         self.go_entry.grid(row=3, column=0, padx=6, pady=4)
         ttk.Label(man, text="in").grid(row=3, column=1)
         ttk.Button(man, text="Move", command=self.send_goto).grid(row=3, column=2, padx=6)
+
+        # jog: nudge the stage by a fixed step relative to where it is now
+        ttk.Label(man, text="Jog (relative move):").grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 0))
+        jog = ttk.Frame(man)
+        jog.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=4)
+        ttk.Button(jog, text="−", width=4,
+                   command=lambda: self.send_jog(-1)).grid(row=0, column=0)
+        self.jog_entry = ttk.Entry(jog, width=8, justify="center")
+        self.jog_entry.insert(0, "0.01")
+        self.jog_entry.grid(row=0, column=1, padx=4)
+        ttk.Label(jog, text="in").grid(row=0, column=2)
+        ttk.Button(jog, text="+", width=4,
+                   command=lambda: self.send_jog(+1)).grid(row=0, column=3, padx=(4, 0))
 
         # --- program editor ---
         self.build_program_section(root)
@@ -167,6 +190,10 @@ class StageGUI:
         self.repeat_entry.insert(0, "1")
         self.repeat_entry.grid(row=0, column=2)
         ttk.Label(loopf, text="times  (0 = forever)").grid(row=0, column=3, padx=4)
+        self.csv_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(loopf, text="Log position to CSV",
+                        variable=self.csv_var).grid(row=1, column=0, columnspan=4,
+                                                    sticky="w", pady=(4, 0))
 
         # run / stop
         runf = ttk.Frame(prog)
@@ -329,6 +356,9 @@ class StageGUI:
         self.prog_steps = steps
         self.prog_index = 0
         self.loops_done = 0
+        self.run_start = time.monotonic()
+        self.last_sample = 0.0
+        self._open_csv()
         self.prog_running = True
         self.set_edit_enabled(False)
         self.run_btn.config(state="disabled")
@@ -351,11 +381,13 @@ class StageGUI:
         self.awaiting_move = True
         self.prog_state = "move"
         self.send(f"GOTO {step['pos']:.5f}")
+        self._csv_log("move_start")
 
     def _begin_dwell(self):
         step = self.prog_steps[self.prog_index]
         self.dwell_deadline = time.monotonic() + step["dwell_s"]
         self.prog_state = "dwell"
+        self._csv_log("dwell_start")
 
     def _advance(self):
         self.prog_index += 1
@@ -374,6 +406,11 @@ class StageGUI:
     def prog_tick(self):
         if not self.prog_running:
             return
+        # Sample position ~once per second so long holds get regular CSV rows.
+        now = time.monotonic()
+        if self.csv_writer and now - self.last_sample >= 1.0:
+            self.last_sample = now
+            self._csv_log(self.prog_state or "")
         if self.prog_state == "move":
             if not self.awaiting_move:
                 if self.move_result == "ok":
@@ -404,6 +441,8 @@ class StageGUI:
         self._finish_program("Program stopped by user.")
 
     def _finish_program(self, msg):
+        self._csv_log("end")
+        self._close_csv()
         self.prog_running = False
         self.prog_state = None
         self.awaiting_move = False
@@ -413,6 +452,57 @@ class StageGUI:
         self.stop_prog_btn.config(state="disabled")
         self.prog_status.set(msg)
         self.logmsg(f"[{msg}]")
+
+    # ---------- CSV position logging ----------
+    def _open_csv(self):
+        self.csv_file = None
+        self.csv_writer = None
+        if not self.csv_var.get():
+            return
+        default = datetime.now().strftime("stage_log_%Y%m%d_%H%M%S.csv")
+        path = filedialog.asksaveasfilename(
+            title="Save position log", defaultextension=".csv", initialfile=default,
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if not path:
+            self.logmsg("[no file chosen -- running without a CSV log]")
+            return
+        try:
+            self.csv_file = open(path, "w", newline="")
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(
+                ["timestamp", "elapsed_s", "position_in", "target_in", "step", "phase"])
+            self.csv_file.flush()
+            self.logmsg(f"[logging position to {path}]")
+        except OSError as e:
+            messagebox.showerror("Log failed", str(e))
+            self.csv_file = None
+            self.csv_writer = None
+
+    def _csv_log(self, phase):
+        if not self.csv_writer:
+            return
+        ts = datetime.now().isoformat(sep=" ", timespec="milliseconds")  # absolute date/time
+        elapsed = time.monotonic() - self.run_start
+        pos = "" if self.last_pos_in is None else f"{self.last_pos_in:.5f}"
+        if 0 <= self.prog_index < len(self.prog_steps):
+            target = f"{self.prog_steps[self.prog_index]['pos']:.5f}"
+            step = self.prog_index + 1
+        else:
+            target, step = "", ""
+        try:
+            self.csv_writer.writerow([ts, f"{elapsed:.3f}", pos, target, step, phase])
+            self.csv_file.flush()
+        except (OSError, ValueError):
+            pass  # file closed underneath us; ignore
+
+    def _close_csv(self):
+        if self.csv_file:
+            try:
+                self.csv_file.close()
+            except OSError:
+                pass
+        self.csv_file = None
+        self.csv_writer = None
 
     def _highlight(self, active_index):
         for i, r in enumerate(self.step_rows):
@@ -508,6 +598,8 @@ class StageGUI:
         """Emergency stop: writes a raw ESC byte, caught mid-move by the firmware."""
         if self.prog_running:
             # abort the program too, but don't recurse into another ESC
+            self._csv_log("stop")
+            self._close_csv()
             self.prog_running = False
             self.prog_state = None
             self.awaiting_move = False
@@ -550,6 +642,27 @@ class StageGUI:
         if v is not None:
             self.send(f"GOTO {v:.5f}")   # firmware streams POS during the move
 
+    def send_jog(self, direction):
+        """Move by +/- the step size, relative to the current position."""
+        if self.prog_running:
+            messagebox.showinfo("Program running", "Stop the program before jogging manually.")
+            return
+        if self.last_pos_in is None:
+            messagebox.showwarning("Position unknown",
+                                   "Set the current position first, then jog.")
+            return
+        try:
+            step = float(self.jog_entry.get())
+        except ValueError:
+            messagebox.showwarning("Bad step", "Enter a numeric jog step in inches.")
+            return
+        target = self.last_pos_in + direction * abs(step)
+        if not (MIN_IN <= target <= MAX_IN):
+            messagebox.showwarning("Out of range",
+                                   f"Jog would reach {target:.4f} in (limits are 0..1).")
+            return
+        self.send(f"GOTO {target:.5f}")   # firmware streams POS during the move
+
     # =====================================================================
     #  UI updates
     # =====================================================================
@@ -561,7 +674,10 @@ class StageGUI:
             if line.startswith("POS "):
                 parts = line.split()
                 try:
-                    self.pos_var.set(f"{float(parts[1]):.4f} in")
+                    self.last_pos_in = float(parts[1])
+                    self.pos_var.set(f"{self.last_pos_in:.4f} in")
+                    if self.prog_running:
+                        self._csv_log(self.prog_state or "move")
                 except (IndexError, ValueError):
                     pass  # e.g. "POS unknown ..." -- leave readout as-is
             # Let the program runner know when a move has finished.
